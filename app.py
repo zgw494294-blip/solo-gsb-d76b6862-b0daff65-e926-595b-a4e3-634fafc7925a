@@ -7,6 +7,15 @@
   容量的长行会等待子进程开始读取，期间两路输出照常排空、/events 照常
   返回；整行连同末尾换行完整送达，不截断、不限长。终止会立即杀死子
   进程，等待中的写入按约定以 409 结束。
+- 自动对话模式：提交代码、步骤 JSON 数组与总时限（秒），后端按步骤
+  自动等待指定 stdout/stderr 文本、发送单行、关闭 stdin，立即返回
+  run_id。等待跨事件片段匹配，每路从上次匹配末尾继续，已到达与后续
+  内容都参与匹配；脚本只读取、不消费页面事件流。自动运行占用同一单
+  运行槽位：期间手动输入与 EOF 返回 409，手动终止取消脚本、停止后续
+  动作；发送阻塞同样受总时限与终止控制。全部步骤完成且退出码为 0 才
+  成功；超时、写入失败、非零退出或排空后仍有未完成步骤时失败，注明
+  失败位置与原因并终止尚存进程。结果公布与重跑都等到输出排空、进程
+  回收、脚本停止之后；旧脚本只持有旧运行对象，操作不到新运行。
 - 全站同时仅一个未结束运行；旧 run_id 对新进程一律无效。
 - 正常退出与主动终止（SIGKILL，不等程序自行退出）都会先排空两路输出、
   回收进程，之后才公布退出码并允许重跑。
@@ -15,6 +24,7 @@
 
 import codecs
 import os
+import select
 import shutil
 import subprocess
 import sys
@@ -33,6 +43,11 @@ STATE_FINISHED = "finished"
 CHUNK = 4096               # 每次从管道读取的原始字节数
 LONG_POLL_SECONDS = 20     # /events 长轮询最长等待
 
+MAX_STEPS = 200            # 自动对话最多步骤数
+MAX_WAIT_TEXT = 10000      # 单条等待文本的最大长度（字符）
+MAX_LINE = 1000000         # 单行发送的最大长度（字符）
+MAX_TIMEOUT = 3600         # 自动对话总时限上限（秒）
+
 _state_lock = threading.Lock()
 _current_run = None        # 当前（可能是唯一未结束的）运行
 
@@ -40,7 +55,7 @@ _current_run = None        # 当前（可能是唯一未结束的）运行
 class Run:
     """一次子进程运行：两路输出增量解码成事件流，退出码最后公布。"""
 
-    def __init__(self, code):
+    def __init__(self, code, steps=None, timeout=None):
         self.id = uuid.uuid4().hex
         self.events = []            # [{seq, stream, data}]，seq 从 1 递增
         self.seq = 0
@@ -51,6 +66,7 @@ class Run:
         self.state = STATE_RUNNING
         self.exit_code = None
         self.stdin_closed = False
+        self.auto = None            # 自动对话脚本（手动模式为 None）
 
         self.tmpdir = tempfile.mkdtemp(prefix="webrun_")
         self.script = os.path.join(self.tmpdir, "main.py")
@@ -76,6 +92,9 @@ class Run:
         for t in self.pumps:
             t.start()
         threading.Thread(target=self._reaper, daemon=True).start()
+        if steps is not None:
+            self.auto = AutoScript(self, steps, timeout)
+            self.auto.start()
 
     def _emit(self, stream, data):
         with self.cond:
@@ -121,6 +140,12 @@ class Run:
             self.cond.notify_all()
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
+    def slot_busy(self):
+        """单运行槽位是否仍被占用：进程未结束，或自动脚本尚未公布结果。"""
+        if self.state == STATE_RUNNING:
+            return True
+        return self.auto is not None and self.auto.state == "running"
+
     def write_line(self, line):
         """把整行（含末尾换行）写入子进程 stdin。
 
@@ -150,6 +175,44 @@ class Run:
                 return "子进程已关闭标准输入"
         return None
 
+    def write_line_auto(self, line, deadline, cancel_event):
+        """自动对话专用写：与 write_line 同约定，但阻塞受总时限与取消控制。
+
+        把管道切为非阻塞后循环写：管道满时在 select 上短暂等待，每轮
+        都检查取消事件与总时限，因此手动终止或超时都能及时打断发送；
+        整行连同末尾换行仍然完整送达，不截断。
+        """
+        payload = (line + "\n").encode("utf-8")
+        with self.stdin_lock:
+            with self.cond:
+                if self.state != STATE_RUNNING:
+                    return "运行已结束"
+                if self.stdin_closed:
+                    return "标准输入已关闭，写入被拒绝"
+            fd = self.proc.stdin.fileno()
+            # 仅自动运行使用本方法（期间手动输入被 409 拒绝），
+            # 改变阻塞模式不影响手动运行的写路径。
+            os.set_blocking(fd, False)
+            view = memoryview(payload)
+            while view:
+                if cancel_event.is_set():
+                    return "已取消"
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return "超过总时限"
+                try:
+                    n = os.write(fd, view)
+                    view = view[n:]
+                except BlockingIOError:
+                    # 管道已满：等子进程读出一些再写，同时轮询取消与时限
+                    try:
+                        select.select([], [fd], [], min(remaining, 0.2))
+                    except OSError:
+                        return "子进程已关闭标准输入"
+                except OSError:
+                    return "子进程已关闭标准输入"
+        return None
+
     def close_stdin(self):
         """关闭子进程 stdin（发送 EOF）。
 
@@ -166,6 +229,216 @@ class Run:
                         pass
 
 
+class AutoScript:
+    """自动对话脚本：按步骤等待输出文本 / 发送单行 / 关闭 stdin。
+
+    - 等待在每路各自累积的文本上做子串匹配：输出事件可能把一句话切成
+      多个片段，先拼回再匹配，因此跨片段也能命中；每路从上次匹配末尾
+      继续，已到达与后续到达的内容都参与匹配。
+    - 只读取 run.events（页面事件流），用独立游标遍历，从不删除或
+      消费事件，页面轮询不受影响。
+    - 全程受总时限与取消事件控制；结果（成功/失败/取消）在输出排空、
+    进程回收之后才公布，公布前槽位不释放、不能重跑。
+    """
+
+    def __init__(self, run, steps, timeout):
+        self.run = run
+        self.steps = steps
+        self.timeout = timeout
+        self.deadline = time.monotonic() + timeout
+        self.cancel_event = threading.Event()
+        self.state = "running"      # running → success / failed / cancelled
+        self.result = None          # 最终结果事件内容（供 /status 回放）
+        self.buffers = {"stdout": "", "stderr": ""}   # 各路已到达文本
+        self.matched = {"stdout": 0, "stderr": 0}     # 各路已匹配到的位置
+        self.cursor = 0             # 只读游标：run.events 的遍历位置
+        self.thread = threading.Thread(target=self._main, daemon=True)
+
+    def start(self):
+        self.thread.start()
+
+    def cancel(self):
+        self.cancel_event.set()
+
+    def _drain_locked(self):
+        """把新到的 stdout/stderr 事件并入各路缓冲；须持有 run.cond。"""
+        events = self.run.events
+        while self.cursor < len(events):
+            ev = events[self.cursor]
+            self.cursor += 1
+            if ev["stream"] in self.buffers:
+                self.buffers[ev["stream"]] += ev["data"]
+        # 已匹配前缀不会再被搜索，裁掉以防缓冲无限增长
+        for stream in self.buffers:
+            cut = self.matched[stream]
+            if cut > 65536:
+                self.buffers[stream] = self.buffers[stream][cut:]
+                self.matched[stream] = 0
+
+    def _progress(self, index, desc):
+        self.run._emit("auto", {"phase": "step", "index": index,
+                                "total": len(self.steps), "desc": desc})
+
+    @staticmethod
+    def _shown(text):
+        return text if len(text) <= 60 else text[:60] + "…"
+
+    def _wait_text(self, index, stream, text):
+        """等待指定一路输出出现 text；命中返回 None，否则返回失败原因。"""
+        shown = self._shown(text)
+        self._progress(index, "等待 %s 出现「%s」" % (stream, shown))
+        run = self.run
+        with run.cond:
+            while True:
+                self._drain_locked()
+                # 从该路上一次匹配末尾继续找；已到达内容都在缓冲里
+                pos = self.buffers[stream].find(text, self.matched[stream])
+                if pos >= 0:
+                    self.matched[stream] = pos + len(text)
+                    return None
+                if self.cancel_event.is_set():
+                    return "已取消"
+                remaining = self.deadline - time.monotonic()
+                if remaining <= 0:
+                    return "超过总时限 %g 秒，%s 未出现「%s》" % (
+                        self.timeout, stream, shown)
+                if run.state == STATE_FINISHED:
+                    # 两路输出已排空、进程已回收，文本不会再来了
+                    return "输出已排空，%s 始终未出现「%s」" % (stream, shown)
+                run.cond.wait(timeout=min(0.2, remaining))
+
+    def _await_exit(self):
+        """全部步骤完成后，在总时限内等进程退出（FINISHED 即已排空+回收）。"""
+        run = self.run
+        with run.cond:
+            while run.state != STATE_FINISHED:
+                if self.cancel_event.is_set():
+                    return "已取消"
+                remaining = self.deadline - time.monotonic()
+                if remaining <= 0:
+                    return "超过总时限 %g 秒，进程仍未退出" % self.timeout
+                run.cond.wait(timeout=min(0.2, remaining))
+        return None
+
+    def _wait_finished(self):
+        """失败/取消后：进程已被 SIGKILL，等 reaper 排空输出并回收进程。"""
+        run = self.run
+        with run.cond:
+            while run.state != STATE_FINISHED:
+                run.cond.wait(timeout=0.2)
+
+    def _main(self):
+        run = self.run
+        failure = None              # (步骤下标或 None, 原因)
+        cancelled = False
+        at = None                   # 取消时所在步骤（None 表示退出等待阶段）
+        for i, step in enumerate(self.steps):
+            at = i
+            action = step["action"]
+            err = None
+            if action == "wait":
+                err = self._wait_text(i, step["stream"], step["text"])
+            elif action == "send":
+                line = step["line"]
+                self._progress(i, "发送单行「%s」" % self._shown(line))
+                if self.cancel_event.is_set():
+                    err = "已取消"
+                else:
+                    err = run.write_line_auto(line, self.deadline,
+                                              self.cancel_event)
+                    if err is not None and err != "已取消":
+                        err = "写入失败：" + err
+            else:                   # action == "close"
+                self._progress(i, "关闭标准输入（EOF）")
+                if self.cancel_event.is_set():
+                    err = "已取消"
+                else:
+                    run.close_stdin()
+            if err is not None:
+                # 取消优先于失败：终止与超时/写入失败同时发生时记为取消
+                if self.cancel_event.is_set():
+                    cancelled = True
+                else:
+                    failure = (i, err)
+                break
+        if not cancelled and failure is None:
+            at = None
+            self._progress(None, "全部步骤完成，等待进程退出")
+            err = self._await_exit()
+            if err is not None:
+                if self.cancel_event.is_set():
+                    cancelled = True
+                else:
+                    failure = (None, err)
+        if cancelled or failure is not None:
+            # 终止尚存进程（已退出的忽略），并等输出排空、进程回收
+            try:
+                run.proc.kill()
+            except OSError:
+                pass
+            self._wait_finished()
+        # 到此输出已排空、进程已回收；公布结果后脚本结束，槽位随之释放
+        with run.cond:
+            if cancelled:
+                self.state = "cancelled"
+                self.result = {"phase": "result", "state": "cancelled",
+                               "index": at, "total": len(self.steps)}
+            elif failure is not None:
+                self.state = "failed"
+                self.result = {"phase": "result", "state": "failed",
+                               "index": failure[0], "total": len(self.steps),
+                               "reason": failure[1], "exit_code": run.exit_code}
+            elif run.exit_code != 0:
+                self.state = "failed"
+                self.result = {"phase": "result", "state": "failed",
+                               "index": None, "total": len(self.steps),
+                               "reason": "进程退出码为 %s" % run.exit_code,
+                               "exit_code": run.exit_code}
+            else:
+                self.state = "success"
+                self.result = {"phase": "result", "state": "success",
+                               "index": None, "total": len(self.steps),
+                               "exit_code": run.exit_code}
+            run.seq += 1
+            run.events.append({"seq": run.seq, "stream": "auto",
+                               "data": self.result})
+            run.cond.notify_all()
+
+
+def _validate_steps(steps):
+    """校验步骤数组；合法返回 None，否则返回错误信息。"""
+    if not isinstance(steps, list) or not steps:
+        return "steps 必须是非空数组"
+    if len(steps) > MAX_STEPS:
+        return "步骤过多（最多 %d 个）" % MAX_STEPS
+    for i, step in enumerate(steps):
+        where = "步骤 %d：" % (i + 1)
+        if not isinstance(step, dict):
+            return where + "必须是对象"
+        action = step.get("action")
+        if action == "wait":
+            if step.get("stream") not in ("stdout", "stderr"):
+                return where + "stream 必须是 stdout 或 stderr"
+            text = step.get("text")
+            if not isinstance(text, str) or not text:
+                return where + "text 必须是非空字符串"
+            if len(text) > MAX_WAIT_TEXT:
+                return where + "text 过长（最多 %d 字符）" % MAX_WAIT_TEXT
+        elif action == "send":
+            line = step.get("line")
+            if not isinstance(line, str):
+                return where + "line 必须是字符串"
+            if "\n" in line or "\r" in line:
+                return where + "line 不能包含换行（每次只发送单行）"
+            if len(line) > MAX_LINE:
+                return where + "line 过长（最多 %d 字符）" % MAX_LINE
+        elif action == "close":
+            pass
+        else:
+            return where + "未知 action（支持 wait / send / close）"
+    return None
+
+
 def _get_run(run_id):
     """只有与当前运行匹配的 run_id 才有效；旧标识控制不了新进程。"""
     with _state_lock:
@@ -173,6 +446,20 @@ def _get_run(run_id):
     if run is None or run.id != run_id:
         return None
     return run
+
+
+def _slot_busy():
+    """单运行槽位是否被占用：进程未结束，或自动脚本尚未公布结果。"""
+    run = _current_run
+    return run is not None and run.slot_busy()
+
+
+def _auto_info(run):
+    auto = run.auto
+    if auto is None:
+        return None
+    return {"state": auto.state, "total": len(auto.steps),
+            "result": auto.result}
 
 
 @app.route("/")
@@ -187,11 +474,36 @@ def start_run():
     if not code.strip():
         return jsonify({"error": "代码为空"}), 400
     with _state_lock:
-        if _current_run is not None and _current_run.state == STATE_RUNNING:
+        if _slot_busy():
             return jsonify({"error": "已有运行未结束，请先终止"}), 409
         run = Run(code)
         _current_run = run
     # 子进程已启动，立即返回运行标识
+    return jsonify({"run_id": run.id})
+
+
+@app.post("/auto")
+def start_auto():
+    """自动对话模式：代码 + 步骤数组 + 总时限（秒），立即返回 run_id。"""
+    global _current_run
+    data = request.get_json(force=True, silent=True) or {}
+    code = data.get("code", "")
+    if not isinstance(code, str) or not code.strip():
+        return jsonify({"error": "代码为空"}), 400
+    error = _validate_steps(data.get("steps"))
+    if error is not None:
+        return jsonify({"error": error}), 400
+    timeout = data.get("timeout")
+    if (not isinstance(timeout, (int, float)) or isinstance(timeout, bool)
+            or not 0 < timeout <= MAX_TIMEOUT):
+        return jsonify(
+            {"error": "timeout 必须是 0~%d 秒之间的数字" % MAX_TIMEOUT}), 400
+    with _state_lock:
+        if _slot_busy():
+            return jsonify({"error": "已有运行未结束，请先终止"}), 409
+        run = Run(code, steps=data["steps"], timeout=float(timeout))
+        _current_run = run
+    # 子进程与脚本线程已启动，立即返回运行标识
     return jsonify({"run_id": run.id})
 
 
@@ -217,6 +529,8 @@ def events():
             "status": run.state,
             "exit_code": run.exit_code,
             "stdin_closed": run.stdin_closed,
+            "busy": run.slot_busy(),
+            "auto": _auto_info(run),
             "events": fresh,
         })
 
@@ -227,6 +541,8 @@ def send_input():
     run = _get_run(data.get("run_id", ""))
     if run is None:
         return jsonify({"error": "运行标识已失效"}), 409
+    if run.auto is not None and run.auto.state == "running":
+        return jsonify({"error": "自动对话进行中，手动输入被禁用"}), 409
     # 长行可能在此阻塞等待子进程读取，但不影响输出排空与 /events
     error = run.write_line(data.get("line", ""))
     if error is not None:
@@ -240,6 +556,8 @@ def close_stdin():
     run = _get_run(data.get("run_id", ""))
     if run is None:
         return jsonify({"error": "运行标识已失效"}), 409
+    if run.auto is not None and run.auto.state == "running":
+        return jsonify({"error": "自动对话进行中，手动关闭标准输入被禁用"}), 409
     run.close_stdin()
     return jsonify({"ok": True})
 
@@ -250,6 +568,8 @@ def terminate():
     run = _get_run(data.get("run_id", ""))
     if run is None:
         return jsonify({"error": "运行标识已失效"}), 409
+    if run.auto is not None:
+        run.auto.cancel()     # 取消脚本：停止后续动作，结果记为「已取消」
     try:
         run.proc.kill()   # SIGKILL：立即终止，不等程序自行退出
     except OSError:
@@ -263,8 +583,12 @@ def status():
         run = _current_run
     if run is None:
         return jsonify({"state": "idle"})
-    return jsonify({"state": run.state, "run_id": run.id,
-                    "exit_code": run.exit_code})
+    data = {"state": run.state, "run_id": run.id,
+            "exit_code": run.exit_code, "busy": run.slot_busy()}
+    auto = _auto_info(run)
+    if auto is not None:
+        data["auto"] = auto
+    return jsonify(data)
 
 
 if __name__ == "__main__":

@@ -21,6 +21,7 @@
     font: 13px/1.5 "SF Mono", Consolas, "Courier New", monospace;
     padding: 10px; tab-size: 4;
   }
+  #steps { height: 120px; }
   .toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 8px; }
   button {
     background: #2b6cb0; color: #fff; border: 0; border-radius: 6px;
@@ -32,7 +33,12 @@
   button.danger:hover:not(:disabled) { background: #e74c3c; }
   button.ex { background: #2c313a; }
   button.ex:hover:not(:disabled) { background: #3a4150; }
+  input[type=number] {
+    background: #12141a; color: #e6e9ef; border: 1px solid #2c313a;
+    border-radius: 6px; padding: 6px 8px; font-size: 13px; width: 80px;
+  }
   #status { margin-top: 8px; font-size: 13px; color: #8fd3a0; min-height: 20px; }
+  #autoStatus { margin-top: 8px; font-size: 13px; color: #9aa0aa; min-height: 20px; }
   #panes { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; flex: 1; min-height: 220px; }
   @media (max-width: 800px) { #panes { grid-template-columns: 1fr; } }
   .pane pre {
@@ -53,7 +59,7 @@
 <body>
 <header>
   <h1>🐍 Python 实时对话运行器</h1>
-  <div class="hint">粘贴代码 → 运行 → 实时查看 stdout / stderr，可发送一行输入或关闭标准输入（EOF）。全站同时仅一个未结束运行；仅供本机可信代码使用。</div>
+  <div class="hint">粘贴代码 → 运行 → 实时查看 stdout / stderr，可发送一行输入或关闭标准输入（EOF）；也可用自动对话模式：提交步骤 JSON 与总时限，由后端自动等待输出、发送单行、关闭标准输入。全站同时仅一个未结束运行；仅供本机可信代码使用。</div>
 </header>
 
 <section class="card">
@@ -66,8 +72,26 @@
     <button class="ex" data-ex="streams">双路无换行输出</button>
     <button class="ex" data-ex="eof">EOF</button>
     <button class="ex" data-ex="loop">终止</button>
+    <button class="ex" data-ex="auto">自动对话</button>
   </div>
   <div id="status">空闲</div>
+</section>
+
+<section class="card">
+  <h2>自动对话模式（可选）</h2>
+  <textarea id="steps" spellcheck="false" placeholder='步骤 JSON 数组：wait 等待输出文本 / send 发送单行 / close 关闭标准输入（格式详见 README）。例：
+[
+  {"action": "wait", "stream": "stdout", "text": "READY"},
+  {"action": "send", "line": "hello"},
+  {"action": "close"}
+]'></textarea>
+  <div class="toolbar">
+    <span class="hint">总时限（秒）</span>
+    <input id="timeout" type="number" min="1" max="3600" value="30">
+    <button id="autoBtn">▶ 启动自动对话</button>
+    <span class="hint">使用上方代码框中的程序；运行期间手动输入与 EOF 被禁用（409），「终止」会取消脚本。</span>
+  </div>
+  <div id="autoStatus"></div>
 </section>
 
 <section id="panes">
@@ -90,6 +114,7 @@ const $ = id => document.getElementById(id);
 let currentRunId = null;
 let epoch = 0;
 let lastSeq = 0;
+let autoRunning = false;
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
@@ -97,6 +122,7 @@ function setStatus(text) { $("status").textContent = text; }
 
 function setRunning(running) {
   $("runBtn").disabled = running;
+  $("autoBtn").disabled = running;
   $("termBtn").disabled = !running;
   $("sendBtn").disabled = !running;
   $("eofBtn").disabled = !running;
@@ -114,11 +140,36 @@ function appendText(el, text) {
   el.scrollTop = el.scrollHeight;
 }
 
+function renderAuto(d) {
+  const el = $("autoStatus");
+  if (!d) return;
+  if (d.phase === "step") {
+    el.style.color = "#9aa0aa";
+    const where = d.index == null ? "" : `步骤 ${d.index + 1}/${d.total}：`;
+    el.textContent = "自动对话进行中 —— " + where + d.desc;
+  } else if (d.phase === "result") {
+    const where = d.index == null ? "退出等待阶段" : `步骤 ${d.index + 1}/${d.total}`;
+    if (d.state === "success") {
+      el.style.color = "#8fd3a0";
+      el.textContent = `✅ 自动对话成功：全部 ${d.total} 步完成，退出码 0`;
+    } else if (d.state === "failed") {
+      el.style.color = "#f0a8a0";
+      el.textContent = `❌ 自动对话失败（${where}）：${d.reason}`;
+    } else {
+      el.style.color = "#e8c07a";
+      el.textContent = `⏹ 自动对话已取消（${where}），后续步骤未执行`;
+    }
+  }
+}
+
 function renderEvent(ev) {
   if (ev.stream === "stdout") appendText($("out"), ev.data);
   else if (ev.stream === "stderr") appendText($("err"), ev.data);
+  else if (ev.stream === "auto") renderAuto(ev.data);
   else if (ev.stream === "meta" && ev.data && "exit_code" in ev.data) {
-    setStatus("运行结束，退出码 = " + ev.data.exit_code + "（两路输出已排空，可重新运行）");
+    setStatus(autoRunning
+      ? "进程已退出（退出码 " + ev.data.exit_code + "），等待自动对话结果…"
+      : "运行结束，退出码 = " + ev.data.exit_code + "（两路输出已排空，可重新运行）");
   }
 }
 
@@ -141,8 +192,15 @@ async function pollLoop(runId, myEpoch) {
       lastSeq = ev.seq;
       renderEvent(ev);
     }
-    setStdinOpen(!data.stdin_closed);
+    autoRunning = !!(data.auto && data.auto.state === "running");
+    const busy = !!data.busy;
+    $("runBtn").disabled = busy;
+    $("autoBtn").disabled = busy;
+    $("termBtn").disabled = !busy;
+    // 自动对话进行中手动输入被禁用（服务端同样返回 409）
+    setStdinOpen(data.status === "running" && !data.stdin_closed && !autoRunning);
     if (data.status === "finished") {
+      if (busy) { await sleep(200); continue; }  // 自动脚本收尾中：等结果公布
       setRunning(false);
       setStdinOpen(false);
       if (!data.events.some(e => e.stream === "meta")) {
@@ -153,13 +211,16 @@ async function pollLoop(runId, myEpoch) {
   }
 }
 
-function adoptRun(runId) {
+function adoptRun(runId, isAuto) {
   epoch++;
   currentRunId = runId;
   lastSeq = 0;
+  autoRunning = !!isAuto;
   $("out").textContent = "";
   $("err").textContent = "";
+  $("autoStatus").textContent = "";
   setRunning(true);
+  if (autoRunning) setStdinOpen(false);
   setStatus("运行中，run_id = " + runId.slice(0, 8) + "…");
   pollLoop(runId, epoch);
 }
@@ -177,7 +238,34 @@ async function startRun() {
     return;
   }
   const data = await res.json();
-  adoptRun(data.run_id);
+  adoptRun(data.run_id, false);
+}
+
+async function startAuto() {
+  const code = $("code").value;
+  if (!code.trim()) { setStatus("请先粘贴代码"); return; }
+  let steps;
+  try {
+    steps = JSON.parse($("steps").value);
+  } catch (e) {
+    renderAuto(null);
+    $("autoStatus").style.color = "#f0a8a0";
+    $("autoStatus").textContent = "步骤 JSON 解析失败：" + e.message;
+    return;
+  }
+  const timeout = Number($("timeout").value);
+  const res = await fetch("/auto", {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({code, steps, timeout})
+  });
+  if (!res.ok) {
+    const d = await res.json().catch(() => ({}));
+    $("autoStatus").style.color = "#f0a8a0";
+    $("autoStatus").textContent = "无法启动：" + (d.error || ("HTTP " + res.status));
+    return;
+  }
+  const data = await res.json();
+  adoptRun(data.run_id, true);
 }
 
 async function sendLine() {
@@ -205,6 +293,9 @@ async function closeStdin() {
   if (res.ok) {
     setStdinOpen(false);
     setStatus("标准输入已关闭（EOF），此后写入将被拒绝");
+  } else if (res.status === 409) {
+    const d = await res.json();
+    setStatus("关闭被拒绝：" + (d.error || ""));
   }
 }
 
@@ -214,7 +305,9 @@ async function terminate() {
     method: "POST", headers: {"Content-Type": "application/json"},
     body: JSON.stringify({run_id: currentRunId})
   });
-  setStatus("已发送 SIGKILL（不等程序自行退出），正在排空输出并回收进程…");
+  setStatus(autoRunning
+    ? "已取消自动对话并 SIGKILL 终止进程，正在排空输出并回收…"
+    : "已发送 SIGKILL（不等程序自行退出），正在排空输出并回收进程…");
 }
 
 const EXAMPLES = {
@@ -259,13 +352,50 @@ while True:
     print(f"tick {i}", flush=True)
     i += 1
     time.sleep(1)
-`
+`,
+  auto: {
+    code: `# 示例 5：自动对话 —— 后端按步骤 JSON 自动交互
+import sys
+
+print("READY", flush=True)
+name = sys.stdin.readline().strip()
+print(f"你好，{name}！", flush=True)
+print("提示：stderr 上的文本也能等待", file=sys.stderr, flush=True)
+for line in sys.stdin:
+    line = line.rstrip("\\n")
+    if line == "quit":
+        print("BYE", flush=True)
+        break
+    print("ECHO " + line, flush=True)
+`,
+    steps: JSON.stringify([
+      {action: "wait", stream: "stdout", text: "READY"},
+      {action: "send", line: "世界"},
+      {action: "wait", stream: "stdout", text: "你好，世界"},
+      {action: "wait", stream: "stderr", text: "stderr 上的文本也能等待"},
+      {action: "send", line: "hello"},
+      {action: "wait", stream: "stdout", text: "ECHO hello"},
+      {action: "send", line: "quit"},
+      {action: "wait", stream: "stdout", text: "BYE"}
+    ], null, 2),
+    timeout: 30
+  }
 };
 
 for (const btn of document.querySelectorAll("button.ex")) {
-  btn.addEventListener("click", () => { $("code").value = EXAMPLES[btn.dataset.ex]; });
+  btn.addEventListener("click", () => {
+    const ex = EXAMPLES[btn.dataset.ex];
+    if (typeof ex === "string") {
+      $("code").value = ex;
+    } else {
+      $("code").value = ex.code;
+      $("steps").value = ex.steps;
+      $("timeout").value = ex.timeout;
+    }
+  });
 }
 $("runBtn").addEventListener("click", startRun);
+$("autoBtn").addEventListener("click", startAuto);
 $("termBtn").addEventListener("click", terminate);
 $("sendBtn").addEventListener("click", sendLine);
 $("eofBtn").addEventListener("click", closeStdin);
@@ -276,10 +406,11 @@ $("line").addEventListener("keydown", e => { if (e.key === "Enter") sendLine(); 
   try {
     const res = await fetch("/status");
     const data = await res.json();
-    if (data.state === "running") {
-      adoptRun(data.run_id);
+    if (data.busy || data.state === "running") {
+      adoptRun(data.run_id, !!(data.auto && data.auto.state === "running"));
     } else if (data.state === "finished") {
       setStatus("上一次运行已结束，退出码 = " + data.exit_code + "，可直接运行新代码");
+      if (data.auto && data.auto.result) renderAuto(data.auto.result);
     }
   } catch (e) { /* 忽略 */ }
 })();
